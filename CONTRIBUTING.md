@@ -1,6 +1,6 @@
 # Commit Rules
 
-These rules apply to every commit in `xorgdroid`. The goal is a history that is
+These rules apply to every commit in the `xorgdroid` repository (product: `x11droid`). The goal is a history that is
 easy to review, bisect, and reproduce on a host with the NVIDIA 470 driver.
 
 ## Before committing

@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # language: Bash, file: scripts/check-deps.sh, target: Linux host (Ubuntu/Debian/Fedora/Arch)
-# Check x11-droid host prerequisites: binder(binderfs), uinput, LXC, X11/XShm, GLX NVIDIA 470.
+# Check x11droid host prerequisites: binder(binderfs), uinput, LXC, X11/XShm, GLX NVIDIA 470.
 # Usage: scripts/check-deps.sh [--strict] [--no-color]
 #   --strict    exit != 0 when any WARN is present (default: only FAIL)
 #   --no-color  disable colors (automatically off when output is not a TTY)
@@ -40,7 +40,7 @@ hint()    { printf '         %s-> %s%s\n' "$D" "$1" "$N"; }
 has_cmd() { command -v "$1" >/dev/null 2>&1; }
 
 header() {
-    printf '%s\n' "x11-droid — host dependency check"
+    printf '%s\n' "x11droid — host dependency check"
     printf '%s\n' "kernel : $(uname -r)"
     printf '%s\n' "distro : $(. /etc/os-release 2>/dev/null && echo "${PRETTY_NAME:-unknown}" || echo unknown)"
     printf '%s\n' "date   : $(date '+%Y-%m-%d %H:%M:%S')"
@@ -89,13 +89,21 @@ check_x11() {
         fi
     done
 
-    if pkg-config --exists gl 2>/dev/null && [[ -f /usr/include/GL/glx.h ]]; then
-        ok "libGL-dev (GLX)" "pkg-config $(pkg-config --modversion gl 2>/dev/null)"
-    elif [[ -f /usr/include/GL/glx.h ]]; then
-        ok "libGL-dev (GLX)" "header present, .pc missing"
+    # Check for libGL.so.1 runtime (provided by NVIDIA driver) vs dev headers
+    if ldconfig -p 2>/dev/null | grep -q 'libGL\.so\.1'; then
+        ok "libGL.so.1 runtime" "found via ldconfig"
     else
-        fail "libGL-dev (GLX)" "/usr/include/GL/glx.h is missing"
-        [[ -n "$PM" ]] && hint "install: $PM libgl1-mesa-dev libglx-dev"
+        warn "libGL.so.1 runtime" "not found in ldconfig cache"
+        hint "ensure NVIDIA 470 driver is installed (provides libGL.so.1)"
+    fi
+
+    if pkg-config --exists gl 2>/dev/null && [[ -f /usr/include/GL/glx.h ]]; then
+        ok "libGL-dev (GLX headers)" "pkg-config $(pkg-config --modversion gl 2>/dev/null)"
+    elif [[ -f /usr/include/GL/glx.h ]]; then
+        ok "libGL-dev (GLX headers)" "header present, .pc missing"
+    else
+        warn "libGL-dev (GLX headers)" "/usr/include/GL/glx.h missing — not needed if using NVIDIA libGL.so.1"
+        [[ -n "$PM" ]] && hint "install for dev: $PM libgl1-mesa-dev libglx-dev (may conflict with NVIDIA driver)"
     fi
 
     if [[ -n "${DISPLAY:-}" ]] && has_cmd xdpyinfo; then
@@ -260,7 +268,7 @@ check_uinput() {
         hint "kernel without INPUT_UINPUT — use a standard distro kernel"
     fi
 
-    local rule=/etc/udev/rules.d/60-xorgdroid-uinput.rules
+    local rule=/etc/udev/rules.d/60-x11droid-uinput.rules
     if [[ -f "$rule" ]]; then ok "uinput udev rule" "$rule"
     else
         skip "uinput udev rule" "not present (optional, for persistent non-root access)"
