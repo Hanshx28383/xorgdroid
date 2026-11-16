@@ -1,0 +1,261 @@
+# x11droid — Laporan Implementasi dan Hasil Uji
+
+Tanggal uji : 2026-11-16 10:15 UTC
+Repo       : xorgdroid (commit 09b190f + working tree, belum di-commit)
+Host uji   : Linux 6.8.0-1070-azure x86_64, Ubuntu 24.04
+Compiler   : gcc 13.3.0, GNU Make 4.3
+Android    : NDK r30, clang 21.0.0, API 30, ABI x86_64 (Bionic)
+X server   : Xvfb 21.1.12 (tanpa ekstensi GLX), xwd x11-apps 7.7
+
+## 1. Ringkasan
+
+Semua pengujian yang dapat dijalankan di container ini lulus:
+
+- build bersih dari `make clean`: host-daemon, test_producer,
+  hwcomposer.x11.so, libGLES_x11droid.so;
+- end-to-end framebuffer Xvfb, jalur MIT-SHM dan fallback XPutImage,
+  terverifikasi piksel-per-piksel terhadap pola frame ke-30;
+- layout shared memory (header 64 byte, seq atomik, stride 2880);
+- HWC2 host harness: HMI, open, function table, callback, vsync, close;
+- protokol GLES client/server memakai mock server: framing, payload
+  variabel, mapping ID, info log, readPixels, getString;
+- verifikasi ELF/NEEDED/simbol dan paket rilis `make dist`.
+
+Yang belum dapat diuji di sini: eksekusi GL nyata (GLX NVIDIA 470),
+pemuatan HAL di image Android asli, dan integrasi SurfaceFlinger penuh.
+Itu batas lingkungan uji, bukan kegagalan build.
+
+## 2. Arsitektur
+
+Alur framebuffer:
+
+    SurfaceFlinger / app
+        -> HWC2 client composition (hwcomposer.x11.so)
+        -> salin RGBA ke /dev/shm/x11droid_fb (header 64 B + 720x1280x4)
+        -> kirim xd_msg (magic XMG1, seq) ke /tmp/x11droid.sock
+        -> host-daemon: XShmPutImage / XPutImage / GLX
+        -> jendela X11 720x1280
+
+Alur GLES:
+
+    app GLES 2.0
+        -> libGLES_x11droid.so (NDK, LD_PRELOAD)
+        -> command + payload via /tmp/x11droid_gl.sock
+        -> gles_server thread di host-daemon
+        -> glx_lock: glXMakeCurrent(ctx utama), eksekusi GL, release
+
+Kunci desain:
+
+- tanpa Wayland/weston/wlroots/waydroid;
+- tanpa GBM/DMA-BUF di host; piksel lewat shared memory;
+- HWC2 memaksa semua layer `CLIENT`, sehingga SurfaceFlinger merender
+  komposisi dan HAL hanya menyalin hasil akhir;
+- GLES server memakai konteks GLX yang sama dengan komposisi jendela,
+  diserialisasi oleh mutex + make-current per perintah.
+
+## 3. Implementasi utama
+
+Host (C11):
+
+- `host-daemon/x11droid_daemon.c`: X11 window, MIT-SHM dengan fallback
+  XPutImage, GLX path, socket trigger, input uinput, cleanup.
+- `host-daemon/glx_render.c`: GLX via `dlopen("libGL.so.1")`, tekstur
+  fullscreen, `glx_lock/glx_unlock`, start/stop GLES server.
+- `host-daemon/gles_stream/gles_server.c`: server command persisten,
+  handler nyata untuk shader/program/buffer/vertex attrib/tekstur/
+  uniform/state/draw/readPixels/getString, reply memakai `seq` asli,
+  timeout socket 5 detik, terjemahan GLSL ES 1.00 -> GLSL 1.20.
+- `host-daemon/gles_stream/gl_decl.h`: tipe 64-bit (`GLsizeiptr`,
+  `GLintptr`), `GLchar`/`GLubyte`, konstanta dan prototipe GL desktop.
+
+Android (NDK, C/C++):
+
+- `android/hwcomposer/`: HAL HWC2 minimal, client composition, sink shm,
+  binder thread vsync.
+- `android/gles_stream/src/gles_client.c`: client GLES 2.0; `send_request_ex`
+  mengirim payload variabel sebelum menunggu respons (menghindari deadlock),
+  buffer info log/getString/readPixels sesuai ukuran, `pixel_bytes()`,
+  perbaikan `glUseProgram(0)` rekursif, penanganan panjang string shader
+  negatif/nol (null-terminated).
+- `android/gles_stream/Makefile`: build langsung dengan NDK clang,
+  output `build/android/gles_stream/libGLES_x11droid.so`.
+
+Perubahan build penting:
+
+- host menaut GL memakai `-l:libGL.so.1`; tidak perlu symlink dev;
+- `gles_stream_proto.h` self-contained dan disalin ke host;
+- root Makefile membangun kedua komponen Android dan memaketkan keduanya.
+
+## 4. Build
+
+Perintah:
+
+    export ANDROID_NDK_HOME=/tmp/android-ndk/android-ndk-r30
+    make clean
+    make all
+    make dist
+
+Hasil: rc=0, tanpa warning pada build host maupun NDK. Artefak:
+
+    build/host-daemon/x11droid-daemon             226.080 byte
+    build/android/hwcomposer/hwcomposer.x11.so  1.596.368 byte
+    build/android/gles_stream/libGLES_x11droid.so  76.584 byte
+
+Pemeriksaan ELF:
+
+- daemon: PIE x86-64, NEEDED libX11, libXext, libGL.so.1, libc;
+- hwcomposer.x11.so: ELF Bionic x86-64, SONAME hwcomposer.x11.so,
+  NEEDED liblog, libdl, libm, libc; simbol `HMI` diekspor;
+- libGLES_x11droid.so: ELF Bionic x86-64, SONAME libGLES_x11droid.so,
+  NEEDED liblog, libdl, libc; 62 simbol `gl*` diekspor, termasuk
+  `glCreateShader`, `glShaderSource`, `glTexImage2D`, `glReadPixels`,
+  `glUniform4fv`, `glDrawArrays`, `glGetString`.
+
+## 5. Hasil pengujian
+
+### 5.1 End-to-end framebuffer (Xvfb, MIT-SHM)
+
+Skenario: Xvfb 720x1280x24, daemon tanpa input, producer 30 frame,
+capture XWD dari jendela daemon. Verifikasi membaca data piksel setelah
+header dan tabel warna XWD (offset = header_size + ncolors*12), lalu
+membandingkan tiga titik dengan pola deterministik frame ke-30.
+
+    XWD: w=720 h=1280 bpl=2880 pixoff=3179
+    center=ffae5f10 topleft=ffe80d32 bottomright=ffffffff
+    expected center=ffae5f10 topleft=ffe80d32 bottomright=ffffffff
+    PRODUCER_EXIT=0
+    MATCH=True (ketiga titik)
+
+Log daemon: `MIT-SHM active (720x1280, 2880 bytes/row)`; keluar bersih.
+
+### 5.2 Fallback XPutImage (`--no-shm`)
+
+Skenario sama, MIT-SHM dimatikan. Log: `XPutImage fallback (MIT-SHM
+not used)`. Capture jendela:
+
+    center=ffae5f10 topleft=ffe80d32 bottomright=ffffffff
+    expected center=ffae5f10 topleft=ffe80d32 bottomright=ffffffff
+    MATCH=True
+    NOSHM_PRODUCER_RC=0
+
+### 5.3 Header shared memory
+
+Dibaca saat daemon hidup setelah 30 frame:
+
+    magic=0x31424458 ("XDB1") version=1 w=720 h=1280
+    stride=2880 bpp=4 fmt=0 seq=30
+
+Ukuran file: 64 + 720*1280*4 = 3.686.464 byte.
+
+### 5.4 HWC2 host harness
+
+Library hwcomposer hasil kompilasi host (source sama) di-dlopen oleh
+harness C++:
+
+    HMI tag=0x48574d54 id=hwcomposer name=x11droid hwcomposer
+    open rc=0
+    version=0x2000001 (HWC_DEVICE_API_VERSION_2_0, header 1)
+    getFunction found=44 missing=77 (dari 121 deskriptor diuji)
+    getCapabilities count=0
+    registerCallback hotplug=0 refresh=0 vsync=0
+    getDisplayConfigs rc=0 count=1
+    setVsync enable=0 disable=0 emitted=5 (jendela 80 ms, ~16 ms)
+    close rc=0
+    HWC_RC=0
+
+Catatan: berkas .so Bionic tidak dapat dimuat proses glibc, sehingga
+harness memakai library host dari source yang sama. Pemuatan .so NDK
+harus diuji di container Android.
+
+### 5.5 Protokol GLES vs mock server
+
+Client asli dikompilasi di host dengan shim header GLES2, dihubungkan ke
+mock server Python yang memakai layout C yang sama. Urutan command yang
+diterima server:
+
+    [1, 2, 4, 5, 7, 8, 9, 34, 39, 15, 59, 61, 12, 6]
+
+Hasil client:
+
+    shader=1
+    status=1 log='hello' len=5
+    prog=2 loc=3
+    buf=3,4
+    px0=0 px15=15
+    version='mock-GL'
+    HARNESS_RC=0 MOCK_RC=0
+
+Ini menguji framing header/response, pengiriman payload variabel,
+mapping ID host<->client, info log, readPixels, getString, dan urutan
+use/delete. Isi eksekusi GL di server tetap perlu uji GPU nyata.
+
+### 5.6 Paket rilis
+
+`make dist` menghasilkan `build/x11droid-release.tar.gz` (600 KB) berisi:
+
+    x11droid-daemon
+    hwcomposer.x11.so
+    libGLES_x11droid.so
+    launch_container.sh
+    check-deps.sh
+    config
+    README.md
+    CONTRIBUTING.md
+    report.txt
+
+## 6. Batasan yang belum teruji
+
+1. Jalur GLX/GLES nyata belum dieksekusi karena Xvfb tidak menyediakan
+   ekstensi GLX dan container tidak memiliki GPU NVIDIA 470. Handler
+   server, shader translation, dan readback GPU baru teruji secara
+   protokol.
+2. hwcomposer.x11.so dan libGLES_x11droid.so belum dimuat di image
+   Android asli; harness host memvalidasi logika, bukan ABI runtime
+   Bionic di SurfaceFlinger.
+3. Integrasi surface/layer HWC2 baru pada level API; komposisi
+   SurfaceFlinger penuh belum diuji.
+4. Shader hanya mendukung subset GLSL ES 1.00 yang diterjemahkan ke
+   GLSL 1.20; ES 3.x, extension OES, dan presisi mediump/lowp belum
+   dipetakan.
+5. `glVertexAttribPointer`/`glDrawElements` mengasumsikan VBO terikat;
+   client-side array belum didukung.
+6. `glGetString` diteruskan apa adanya dari konteks desktop, sehingga
+   `GL_VERSION`/`GL_SHADING_LANGUAGE_VERSION` dapat terbaca sebagai
+   versi desktop, bukan "OpenGL ES 2.0".
+7. Belum ada sinkronisasi frame eksplisit antara draw GLES dan present;
+   aplikasi harus memanggil glFinish/glFlush bila perlu.
+8. Input uinput tidak diuji pada run ini (daemon dijalankan dengan
+   `--no-input`), meskipun `/dev/uinput` tersedia.
+
+## 7. Langkah verifikasi di host target (NVIDIA 470)
+
+1. `make host`
+2. Jalankan `build/host-daemon/x11droid-daemon` pada `$DISPLAY` Xorg.
+   Pastikan log memuat:
+   `[glx] komposisi OpenGL via GLX aktif`
+   `[gles_server] listening on /tmp/x11droid_gl.sock`
+3. `build/host-daemon/test_producer --frames 30`, lalu capture jendela
+   dengan xwd; nilai tengah harus sesuai pola frame ke-30
+   (`ffae5f10` untuk build ini).
+4. Di container Android, pasang `libGLES_x11droid.so` di
+   `/vendor/lib64/`, jalankan aplikasi GLES 2.0 dengan
+   `LD_PRELOAD=/vendor/lib64/libGLES_x11droid.so`.
+5. Uji draw nyata (segitiga/tekstur), cek tidak ada deadlock, dan ukur
+   latensi per frame. Bila shader gagal, periksa terjemahan GLSL di
+   `gles_server.c`.
+
+## 8. Bukti log
+
+- `/tmp/opencode/build.log` — clean build rc=0
+- `/tmp/opencode/functional_out.log` — e2e MIT-SHM + sampling
+- `/tmp/opencode/daemon_test.log`, `producer_test.log`
+- `/tmp/opencode/report_shot.xwd` — capture jendela
+- `/tmp/opencode/noshm_capture.log`, `daemon_noshm.log` — fallback
+- `/tmp/opencode/fb_header.log` — header shared memory
+- `/tmp/opencode/hwc_harness.log` — HWC2 harness
+- `/tmp/opencode/harness.log`, `mock_server.log` — protokol GLES
+- `/tmp/opencode/static_checks.log` — file/NEEDED/simbol
+- `/tmp/opencode/mock_build.log`, `client_build.log` — build client
+
+Catatan: direktori `/tmp/opencode` bersifat sementara; perintah dan
+nilai hasil di laporan ini cukup untuk reproduksi.

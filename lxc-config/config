@@ -1,0 +1,45 @@
+# language: LXC config, file: lxc-config/config, target: Android x86_64 (LXC privileged)
+# x11-droid template. Tokens @...@ are filled in by scripts/launch_container.sh.
+# system.img and vendor.img are never written: overlayfs uses a read-only lowerdir.
+
+# -------------------------------------------------------------------- identity
+lxc.arch = x86_64
+lxc.uts.name = @NAME@
+lxc.rootfs.path = dir:@ROOTFS@
+lxc.init.cmd = @INIT_CMD@
+lxc.init.uid = 0
+lxc.init.gid = 0
+lxc.apparmor.profile = unconfined
+# /dev is assembled explicitly through the rootfs skeleton and mount.entry below
+lxc.autodev = 0
+lxc.cap.drop =
+lxc.cgroup2.devices.allow = a
+lxc.mount.auto = proc:mixed sys:ro cgroup:mixed
+lxc.start.auto = 0
+lxc.log.file = @LOG@
+lxc.log.level = 2
+lxc.console.buffer.size = 256k
+lxc.console.size = 256k
+
+# ------------------------------------------------- overlayfs (host, rw)
+lxc.mount.entry = @SYSTEM_MNT@ system none bind,create=dir,rw 0 0
+lxc.mount.entry = @VENDOR_MNT@ vendor none bind,create=dir,rw 0 0
+lxc.mount.entry = @DATA_DIR@ data none bind,create=dir,rw 0 0
+lxc.mount.entry = tmpfs tmp tmpfs mode=1777,size=64m,create=dir 0 0
+
+# --------------------------------------------------------------- binderfs
+@BINDER_ENTRIES@
+
+# ------------------------------------- framebuffer + host daemon socket
+lxc.mount.entry = tmpfs dev/shm tmpfs mode=1777,size=32m,create=dir 0 0
+lxc.mount.entry = @FB_PATH@ dev/shm/x11droid_fb none bind,optional,create=file 0 0
+lxc.mount.entry = @SOCK_PATH@ tmp/x11droid.sock none bind,optional,create=file 0 0
+
+# --------------------------------------------------- base /dev devices
+@DEV_ENTRIES@
+
+# --------------------------------------- x11droid virtual input
+@INPUT_ENTRIES@
+
+# ------------------------------------------------------------------- network
+@NETWORK_ENTRIES@

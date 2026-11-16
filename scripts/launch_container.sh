@@ -1,0 +1,520 @@
+#!/usr/bin/env bash
+# language: Bash, file: scripts/launch_container.sh, target: Linux host (root)
+# Launch an Android x86_64 image under LXC with:
+#   - system.img / vendor.img as read-only overlayfs lowerdirs
+#   - /data and the overlay upperdirs on the host (safe across power loss)
+#   - binder/hwbinder/vndbinder, framebuffer, socket, and x11droid input binds
+#
+# Usage:
+#   sudo scripts/launch_container.sh                 # prepare + start
+#   sudo scripts/launch_container.sh --no-start      # prepare + mount only
+#   sudo scripts/launch_container.sh --stop          # stop + release mounts
+#   sudo scripts/launch_container.sh --clean --yes   # remove overlay state
+set -Eeuo pipefail
+umask 022
+
+SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+PROJECT_ROOT=$(cd -- "$SCRIPT_DIR/.." && pwd)
+TEMPLATE="$PROJECT_ROOT/lxc-config/config"
+
+NAME="x11droid"
+IMAGES_DIR="$PROJECT_ROOT/container/images"
+SYSTEM_IMG=""
+VENDOR_IMG=""
+STATE_DIR="/var/lib/x11droid"
+LXC_PATH="${LXC_PATH:-/var/lib/lxc}"
+FB_PATH="/dev/shm/x11droid_fb"
+SOCK_PATH="/tmp/x11droid.sock"
+
+ACTION="start"
+DO_START=1
+ASSUME_YES=0
+KEEP_MOUNTS=0
+
+SYSTEM_RO=""
+SYSTEM_MNT=""
+VENDOR_RO=""
+VENDOR_MNT=""
+OVL_SYS=""
+OVL_VENDOR=""
+ROOTFS=""
+DATA_DIR=""
+STATE_CONFIG=""
+LOG_FILE=""
+INIT_CMD=""
+BINDER_ENTRIES=""
+DEV_ENTRIES=""
+INPUT_ENTRIES=""
+NETWORK_ENTRIES=""
+
+log()  { printf '[x11droid] %s\n' "$*"; }
+warn() { printf '[x11droid] WARN: %s\n' "$*" >&2; }
+die()  { printf '[x11droid] ERROR: %s\n' "$*" >&2; exit 1; }
+
+usage() {
+    cat <<EOF
+Usage: $0 [action] [options]
+
+Actions:
+  (default)        prepare overlays, write the LXC config, then start the container
+  --no-start       prepare + mount, but do not run lxc-start
+  --stop           stop the container and release all overlay mounts
+  --clean          --stop + remove overlay/data state (requires --yes or confirmation)
+
+Options:
+  --name NAME      LXC container name (default: x11droid)
+  --images DIR     directory containing system.img and vendor.img
+  --system FILE    system.img path (overrides --images)
+  --vendor FILE    vendor.img path (overrides --images)
+  --state DIR      state/overlay directory (default: $STATE_DIR)
+  --lxcpath DIR    LXC directory (default: $LXC_PATH)
+  --fb PATH        host POSIX shm framebuffer (default: $FB_PATH)
+  --sock PATH      host daemon Unix socket (default: $SOCK_PATH)
+  --yes            do not prompt for --clean confirmation
+  -h, --help       show this help
+
+Start prerequisites:
+  host-daemon running (framebuffer, socket, x11droid-touch, x11droid-kbd)
+  binder_linux / binderfs available
+  lxc-start, lxc-info, lxc-stop installed
+EOF
+}
+
+require_root() {
+    [ "$(id -u)" -eq 0 ] || die "run as root: sudo $0 $*"
+}
+
+need_cmd() {
+    command -v "$1" >/dev/null 2>&1 || die "command '$1' not found"
+}
+
+derive_paths() {
+    local mnt="$STATE_DIR/mnt"
+    SYSTEM_RO="$mnt/system-ro"
+    SYSTEM_MNT="$mnt/system"
+    VENDOR_RO="$mnt/vendor-ro"
+    VENDOR_MNT="$mnt/vendor"
+    OVL_SYS="$STATE_DIR/overlay/system"
+    OVL_VENDOR="$STATE_DIR/overlay/vendor"
+    ROOTFS="$STATE_DIR/rootfs"
+    DATA_DIR="$STATE_DIR/data"
+    STATE_CONFIG="$STATE_DIR/config"
+    LOG_FILE="$STATE_DIR/lxc.log"
+}
+
+release_mounts() {
+    local p
+    for p in "$VENDOR_MNT" "$SYSTEM_MNT" "$VENDOR_RO" "$SYSTEM_RO"; do
+        [ -n "$p" ] || continue
+        mountpoint -q "$p" 2>/dev/null || continue
+        umount "$p" 2>/dev/null || {
+            sleep 0.3
+            umount "$p" 2>/dev/null
+        } || {
+            warn "mount is busy, lazy umount: $p"
+            umount -l "$p" 2>/dev/null || true
+        }
+    done
+
+    for p in "$VENDOR_MNT" "$SYSTEM_MNT" "$VENDOR_RO" "$SYSTEM_RO"; do
+        [ -n "$p" ] || continue
+        mountpoint -q "$p" 2>/dev/null && warn "mount is still present: $p"
+    done
+}
+
+on_exit() {
+    local rc=$?
+    if [ "$rc" -ne 0 ] && [ "$KEEP_MOUNTS" -ne 1 ]; then
+        release_mounts || true
+    fi
+}
+trap on_exit EXIT
+
+container_state() {
+    command -v lxc-info >/dev/null 2>&1 || return 0
+    lxc-info -P "$LXC_PATH" -n "$NAME" -sH 2>/dev/null | head -n1 || true
+}
+
+stop_container() {
+    local state
+    state=$(container_state)
+    if [ "$state" = "RUNNING" ]; then
+        log "stopping container $NAME"
+        command -v lxc-stop >/dev/null 2>&1 || die "lxc-stop not found"
+        lxc-stop -P "$LXC_PATH" -n "$NAME" -t 10 >/dev/null 2>&1 || true
+        local i
+        for i in $(seq 1 50); do
+            state=$(container_state)
+            [ "$state" != "RUNNING" ] && break
+            sleep 0.2
+        done
+        [ "$state" != "RUNNING" ] || die "container did not stop: $NAME"
+    elif [ -n "$state" ] && [ "$state" != "STOPPED" ]; then
+        warn "container state: $state"
+    fi
+}
+
+ensure_dirs() {
+    mkdir -p \
+        "$STATE_DIR/images" \
+        "$OVL_SYS/upper" "$OVL_SYS/work" \
+        "$OVL_VENDOR/upper" "$OVL_VENDOR/work" \
+        "$STATE_DIR/mnt" \
+        "$ROOTFS" "$DATA_DIR"
+}
+
+ensure_flat_image() {
+    local img=$1 magic raw
+    magic=$(od -An -tx1 -N4 "$img" | tr -d ' \n')
+    if [ "$magic" = "3aff26ed" ]; then
+        command -v simg2img >/dev/null 2>&1 || \
+            die "$img is an Android sparse image; install simg2img (android-sdk-libsparse-utils) or convert it manually"
+        raw="$STATE_DIR/images/$(basename "$img").raw"
+        if [ ! -f "$raw" ]; then
+            log "converting sparse -> raw: $(basename "$img") (one-time, may take a while)"
+            simg2img "$img" "$raw"
+        fi
+        printf '%s\n' "$raw"
+    else
+        printf '%s\n' "$img"
+    fi
+}
+
+resolve_images() {
+    [ -n "$SYSTEM_IMG" ] || SYSTEM_IMG="$IMAGES_DIR/system.img"
+    [ -n "$VENDOR_IMG" ] || VENDOR_IMG="$IMAGES_DIR/vendor.img"
+    [ -f "$SYSTEM_IMG" ] || die "system.img not found: $SYSTEM_IMG (use --images/--system)"
+    [ -f "$VENDOR_IMG" ] || die "vendor.img not found: $VENDOR_IMG (use --images/--vendor)"
+    SYSTEM_IMG=$(ensure_flat_image "$SYSTEM_IMG")
+    VENDOR_IMG=$(ensure_flat_image "$VENDOR_IMG")
+    log "system: $SYSTEM_IMG"
+    log "vendor: $VENDOR_IMG"
+}
+
+binder_src() {
+    local dev=$1
+    if [ -e "/dev/binderfs/$dev" ]; then
+        printf '/dev/binderfs/%s\n' "$dev"
+        return 0
+    fi
+    if [ -e "/dev/$dev" ]; then
+        printf '/dev/%s\n' "$dev"
+        return 0
+    fi
+    return 1
+}
+
+try_enable_binder() {
+    if ! mountpoint -q /dev/binderfs 2>/dev/null; then
+        if grep -qw binder /proc/filesystems 2>/dev/null; then
+            mkdir -p /dev/binderfs
+            mount -t binder binder /dev/binderfs 2>/dev/null || true
+        fi
+    fi
+    if [ ! -e /dev/binder ] && command -v modprobe >/dev/null 2>&1; then
+        modprobe binder_linux devices=binder,hwbinder,vndbinder 2>/dev/null || true
+    fi
+}
+
+collect_binder_entries() {
+    BINDER_ENTRIES=""
+    local dev src missing=""
+
+    for dev in binder hwbinder vndbinder; do
+        binder_src "$dev" >/dev/null 2>&1 || missing="$missing $dev"
+    done
+
+    if [ -n "$missing" ]; then
+        try_enable_binder
+        missing=""
+        for dev in binder hwbinder vndbinder; do
+            binder_src "$dev" >/dev/null 2>&1 || missing="$missing $dev"
+        done
+    fi
+
+    if [ -n "$missing" ]; then
+        die "binder devices are not available:$missing — try:
+  sudo modprobe binder_linux devices=binder,hwbinder,vndbinder
+  sudo mkdir -p /dev/binderfs && sudo mount -t binder binder /dev/binderfs
+  (Ubuntu: linux-modules-extra-\$(uname -r) package)"
+    fi
+
+    if [ -d /dev/binderfs ]; then
+        BINDER_ENTRIES+="lxc.mount.entry = /dev/binderfs dev/binderfs none bind,optional,create=dir 0 0"$'\n'
+    fi
+    for dev in binder hwbinder vndbinder; do
+        src=$(binder_src "$dev")
+        BINDER_ENTRIES+="lxc.mount.entry = $src dev/$dev none bind,optional,create=file 0 0"$'\n'
+        log "binder: $src -> /dev/$dev"
+    done
+}
+
+collect_input_entries() {
+    INPUT_ENTRIES=""
+    local f name ev node mm major minor found_touch=0 found_kbd=0
+
+    for f in /sys/class/input/event*/device/name; do
+        [ -r "$f" ] || continue
+        name=$(<"$f")
+        case "$name" in
+            x11droid-touch) found_touch=1 ;;
+            x11droid-kbd)   found_kbd=1 ;;
+            *) continue ;;
+        esac
+
+        ev=$(basename "$(dirname "$(dirname "$f")")")
+        node="/dev/input/$ev"
+        if [ ! -e "$node" ]; then
+            mm=$(<"/sys/class/input/$ev/dev")
+            major=${mm%%:*}
+            minor=${mm##*:}
+            mkdir -p /dev/input
+            mknod -m 660 "$node" c "$major" "$minor"
+            warn "node $node was missing; created from sysfs ($mm)"
+        fi
+        INPUT_ENTRIES+="lxc.mount.entry = $node dev/input/$ev none bind,optional,create=file 0 0"$'\n'
+        log "input: $node ($name) -> /dev/input/$ev"
+    done
+
+    if [ "$found_touch" -eq 0 ] || [ "$found_kbd" -eq 0 ]; then
+        die "x11droid-touch/x11droid-kbd not found — start host-daemon first (make run)"
+    fi
+}
+
+collect_device_entries() {
+    read -r -d '' DEV_ENTRIES <<'EOF' || true
+lxc.mount.entry = /dev/null dev/null none bind,optional,create=file 0 0
+lxc.mount.entry = /dev/zero dev/zero none bind,optional,create=file 0 0
+lxc.mount.entry = /dev/full dev/full none bind,optional,create=file 0 0
+lxc.mount.entry = /dev/random dev/random none bind,optional,create=file 0 0
+lxc.mount.entry = /dev/urandom dev/urandom none bind,optional,create=file 0 0
+lxc.mount.entry = /dev/tty dev/tty none bind,optional,create=file 0 0
+lxc.mount.entry = devpts dev/pts devpts newinstance,ptmxmode=0666,mode=0620,create=dir 0 0
+lxc.mount.entry = /dev/fuse dev/fuse none bind,optional,create=file 0 0
+lxc.mount.entry = /dev/ashmem dev/ashmem none bind,optional,create=file 0 0
+lxc.mount.entry = /dev/net/tun dev/net/tun none bind,optional,create=file 0 0
+EOF
+}
+
+collect_network_entries() {
+    if command -v ip >/dev/null 2>&1 && ip link show lxcbr0 >/dev/null 2>&1; then
+        NETWORK_ENTRIES=$'lxc.net.0.type = veth\nlxc.net.0.link = lxcbr0\nlxc.net.0.flags = up\n'
+        log "network: veth via lxcbr0"
+    else
+        NETWORK_ENTRIES=$'lxc.net.0.type = none\n'
+        warn "lxcbr0 bridge is missing — container shares the host network namespace (type=none)"
+    fi
+}
+
+check_host_prereqs() {
+    [ -f "$FB_PATH" ] || die "framebuffer $FB_PATH is missing — start host-daemon first (make run)"
+    [ -S "$SOCK_PATH" ] || die "socket $SOCK_PATH is missing — start host-daemon first (make run)"
+    [ -f "$TEMPLATE" ] || die "config template is missing: $TEMPLATE"
+}
+
+mount_overlays() {
+    mkdir -p "$SYSTEM_RO" "$SYSTEM_MNT" "$VENDOR_RO" "$VENDOR_MNT"
+
+    mountpoint -q "$SYSTEM_RO" || \
+        mount -o loop,ro,noatime "$SYSTEM_IMG" "$SYSTEM_RO"
+    mountpoint -q "$VENDOR_RO" || \
+        mount -o loop,ro,noatime "$VENDOR_IMG" "$VENDOR_RO"
+
+    if ! mountpoint -q "$SYSTEM_MNT"; then
+        mount -t overlay overlay \
+            -o "lowerdir=$SYSTEM_RO,upperdir=$OVL_SYS/upper,workdir=$OVL_SYS/work" \
+            "$SYSTEM_MNT" || die "system overlay failed; corrupt state? run: $0 --clean --yes"
+    fi
+    if ! mountpoint -q "$VENDOR_MNT"; then
+        mount -t overlay overlay \
+            -o "lowerdir=$VENDOR_RO,upperdir=$OVL_VENDOR/upper,workdir=$OVL_VENDOR/work" \
+            "$VENDOR_MNT" || die "vendor overlay failed; corrupt state? run: $0 --clean --yes"
+    fi
+
+    log "system overlay : $SYSTEM_RO (ro) + $OVL_SYS/upper -> $SYSTEM_MNT"
+    log "vendor overlay : $VENDOR_RO (ro) + $OVL_VENDOR/upper -> $VENDOR_MNT"
+}
+
+prepare_rootfs() {
+    mkdir -p \
+        "$ROOTFS"/dev/input "$ROOTFS"/dev/shm "$ROOTFS"/dev/pts \
+        "$ROOTFS"/dev/net "$ROOTFS"/dev/socket \
+        "$ROOTFS"/proc "$ROOTFS"/sys "$ROOTFS"/system "$ROOTFS"/vendor \
+        "$ROOTFS"/data "$ROOTFS"/tmp "$ROOTFS"/mnt "$ROOTFS"/storage
+
+    if [ ! -e "$ROOTFS/dev/ptmx" ] && [ ! -L "$ROOTFS/dev/ptmx" ]; then
+        ln -s pts/ptmx "$ROOTFS/dev/ptmx"
+    fi
+
+    INIT_CMD="/system/bin/init"
+    if [ -x "$SYSTEM_MNT/bin/init" ]; then
+        log "Android init: /system/bin/init"
+    elif [ -x "$SYSTEM_MNT/init" ]; then
+        INIT_CMD="/init"
+        ln -sfn system/init "$ROOTFS/init"
+        log "Android init: /init (symlink to system/init)"
+    else
+        warn "init not found in system.img — lxc.init.cmd remains $INIT_CMD"
+    fi
+}
+
+render_config() {
+    local line
+    : > "$STATE_CONFIG"
+    while IFS= read -r line || [ -n "$line" ]; do
+        case "$line" in
+            *"@BINDER_ENTRIES@"*)  printf '%s\n' "$BINDER_ENTRIES"  >> "$STATE_CONFIG"; continue ;;
+            *"@DEV_ENTRIES@"*)     printf '%s\n' "$DEV_ENTRIES"     >> "$STATE_CONFIG"; continue ;;
+            *"@INPUT_ENTRIES@"*)   printf '%s\n' "$INPUT_ENTRIES"   >> "$STATE_CONFIG"; continue ;;
+            *"@NETWORK_ENTRIES@"*) printf '%s\n' "$NETWORK_ENTRIES" >> "$STATE_CONFIG"; continue ;;
+        esac
+
+        line=${line//@NAME@/$NAME}
+        line=${line//@ROOTFS@/$ROOTFS}
+        line=${line//@INIT_CMD@/$INIT_CMD}
+        line=${line//@LOG@/$LOG_FILE}
+        line=${line//@SYSTEM_MNT@/$SYSTEM_MNT}
+        line=${line//@VENDOR_MNT@/$VENDOR_MNT}
+        line=${line//@DATA_DIR@/$DATA_DIR}
+        line=${line//@FB_PATH@/$FB_PATH}
+        line=${line//@SOCK_PATH@/$SOCK_PATH}
+        printf '%s\n' "$line" >> "$STATE_CONFIG"
+    done < "$TEMPLATE"
+    chmod 0644 "$STATE_CONFIG"
+}
+
+install_lxc_config() {
+    install -d -m 0700 "$LXC_PATH/$NAME"
+    install -m 0644 "$STATE_CONFIG" "$LXC_PATH/$NAME/config"
+    log "LXC config: $LXC_PATH/$NAME/config"
+}
+
+start_container() {
+    local state i
+    state=$(container_state)
+    if [ "$state" = "RUNNING" ]; then
+        die "container $NAME is already running — use --stop first"
+    fi
+
+    need_cmd lxc-start
+    need_cmd lxc-info
+
+    log "starting lxc-start -n $NAME"
+    if ! lxc-start -P "$LXC_PATH" -n "$NAME" -d; then
+        [ -f "$LOG_FILE" ] && tail -n 20 "$LOG_FILE" >&2 || true
+        die "lxc-start failed"
+    fi
+
+    state=""
+    for i in $(seq 1 30); do
+        state=$(container_state)
+        [ "$state" = "RUNNING" ] && break
+        sleep 0.2
+    done
+
+    if [ "$state" != "RUNNING" ]; then
+        [ -f "$LOG_FILE" ] && tail -n 20 "$LOG_FILE" >&2 || true
+        lxc-stop -P "$LXC_PATH" -n "$NAME" -t 5 >/dev/null 2>&1 || true
+        die "container stopped during startup (init crash? check the log above)"
+    fi
+
+    KEEP_MOUNTS=1
+    log "container $NAME is running"
+    log "  attach : lxc-attach -P $LXC_PATH -n $NAME"
+    log "  stop   : $0 --stop --name $NAME --lxcpath $LXC_PATH"
+}
+
+do_start() {
+    require_root
+    need_cmd mount
+    need_cmd umount
+    need_cmd mountpoint
+    need_cmd od
+    [ -f "$TEMPLATE" ] || die "template is missing: $TEMPLATE"
+
+    [ "$(container_state)" = "RUNNING" ] && die "container $NAME is already running — use --stop first"
+
+    resolve_images
+    ensure_dirs
+    release_mounts
+
+    check_host_prereqs
+    collect_binder_entries
+    collect_input_entries
+    collect_device_entries
+    collect_network_entries
+
+    mount_overlays
+    prepare_rootfs
+    render_config
+    install_lxc_config
+
+    if [ "$DO_START" -eq 0 ]; then
+        KEEP_MOUNTS=1
+        log "mounts are ready; container was not started"
+        log "  start manually: lxc-start -P $LXC_PATH -n $NAME"
+        return 0
+    fi
+
+    start_container
+}
+
+do_stop() {
+    require_root
+    stop_container
+    release_mounts
+    log "container $NAME stopped; overlays and loop devices released"
+}
+
+do_clean() {
+    require_root
+    case "$STATE_DIR" in
+        ""|"/"|*..*) die "STATE_DIR is not safe to delete: $STATE_DIR" ;;
+    esac
+
+    stop_container
+    release_mounts
+
+    if [ "$ASSUME_YES" -ne 1 ]; then
+        printf 'Delete %s and config %s/%s? [y/N] ' "$STATE_DIR" "$LXC_PATH" "$NAME"
+        local answer
+        read -r answer || answer=""
+        case "$answer" in
+            y|Y|yes|YES) ;;
+            *) die "cancelled" ;;
+        esac
+    fi
+
+    rm -rf -- "$STATE_DIR" "$LXC_PATH/$NAME"
+    log "container state and config removed"
+}
+
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --no-start)  DO_START=0 ;;
+        --stop)      ACTION="stop" ;;
+        --clean)     ACTION="clean" ;;
+        --yes)       ASSUME_YES=1 ;;
+        --name)      NAME=${2:?--name requires an argument}; shift ;;
+        --images)    IMAGES_DIR=${2:?--images requires an argument}; shift ;;
+        --system)    SYSTEM_IMG=${2:?--system requires an argument}; shift ;;
+        --vendor)    VENDOR_IMG=${2:?--vendor requires an argument}; shift ;;
+        --state)     STATE_DIR=${2:?--state requires an argument}; shift ;;
+        --lxcpath)   LXC_PATH=${2:?--lxcpath requires an argument}; shift ;;
+        --fb)        FB_PATH=${2:?--fb requires an argument}; shift ;;
+        --sock)      SOCK_PATH=${2:?--sock requires an argument}; shift ;;
+        -h|--help)   usage; exit 0 ;;
+        *)           usage >&2; die "unknown argument: $1" ;;
+    esac
+    shift
+done
+
+[[ "$NAME" =~ ^[A-Za-z0-9][A-Za-z0-9_-]*$ ]] || die "invalid container name: $NAME"
+derive_paths
+
+case "$ACTION" in
+    start) do_start ;;
+    stop)  do_stop ;;
+    clean) do_clean ;;
+    *)     die "unknown action: $ACTION" ;;
+esac

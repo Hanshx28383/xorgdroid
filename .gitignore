@@ -1,0 +1,23 @@
+# Build artifacts
+build/
+*.o
+*.a
+*.so
+*.so.*
+
+# Container images and rootfs (large, never committed)
+container/images/*.img
+container/images/*.tar
+container/images/*.tar.*
+container/images/*.gz
+container/rootfs/
+
+# Runtime state
+*.sock
+*.log
+*.pid
+
+# Editor
+.vscode/
+.idea/
+*.swp
