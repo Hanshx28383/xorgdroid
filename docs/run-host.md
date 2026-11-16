@@ -1,6 +1,23 @@
 # Running on Host
 
-## Quick Commands
+## Quick Commands (Recommended)
+
+```sh
+# Quick test: Xvfb + daemon + 30 frames, auto-exit
+make test
+# or
+./x11droid test
+
+# Demo: daemon + test pattern (Ctrl+C to stop, or after N frames)
+make demo
+./x11droid demo [FRAMES]
+
+# Quick status check
+make status
+./x11droid status
+```
+
+## Legacy Commands (Still Work)
 
 ```sh
 # Build host components
@@ -50,6 +67,30 @@ For XPutImage fallback:
 ./build/host-daemon/x11droid-daemon --no-gl --no-shm &
 ```
 
+## x11droid Script (Single-Command Wrapper)
+
+```sh
+# Quick test: auto Xvfb + daemon + 30 frames, auto-exit
+./x11droid test [FRAMES]
+
+# Demo: daemon + pattern, Ctrl+C to stop
+./x11droid demo [FRAMES]
+
+# Status check
+./x11droid status
+
+# Options
+./x11droid test --headless --no-gl --no-shm --no-input
+```
+
+| Option | Effect |
+|--------|--------|
+| `--headless` | Force Xvfb (auto if DISPLAY empty) |
+| `--no-gl` | Force CPU path (no GLX) |
+| `--no-shm` | Force XPutImage (skip MIT-SHM) |
+| `--no-input` | Skip uinput devices |
+| `--images DIR` | Images dir for `up` (default: `container/images/`) |
+
 ## Daemon Behavior
 
 - Creates 720×1280 X11 window
@@ -65,3 +106,5 @@ For XPutImage fallback:
 | `DISPLAY` | required | X11 display |
 | `XORG_DROID_SOCK` | `/tmp/x11droid.sock` | Socket for `make run` / `demo-producer` |
 | `X11DROID_FB` | `x11droid_fb` | Shm name (override via `--shm`) |
+| `X11DROID_SOCK` | `/tmp/x11droid.sock` | Socket override for `x11droid` script |
+| `X11DROID_SHM` | `x11droid_fb` | Shm override for `x11droid` script |

@@ -14,7 +14,16 @@
 ```sh
 git clone https://github.com/Hanshx28383/xorgdroid && cd x11droid
 make setup       # check deps, build all, install to vendor overlay
-sudo make start  # run daemon + container (needs images in container/images/)
+make test        # quick test: Xvfb + daemon + 30 frames, auto-exit
+make demo        # daemon + test pattern (Ctrl+C to stop)
+sudo make up     # daemon + Android container (Ctrl+C stops all)
+```
+
+**Legacy (still works)**
+```sh
+make setup       # check deps, build all, install to vendor overlay
+make start       # daemon + container (needs images in container/images/)
+make stop        # stop container and daemon
 ```
 
 **Documentation**

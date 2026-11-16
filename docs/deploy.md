@@ -75,6 +75,14 @@ chcon u:object_r:vendor_file:s0 /vendor/lib64/hw/hwcomposer.x11.so
 
 ## Start Host Daemon (Prerequisite)
 
+**New (recommended):**
+```sh
+make run-daemon
+# or
+./x11droid test   # starts daemon + Xvfb
+```
+
+**Legacy:**
 ```sh
 make run-daemon
 # or
@@ -86,8 +94,16 @@ Daemon must be running before container launch — provides:
 - `/tmp/x11droid.sock` (refresh trigger)
 - `x11droid-touch` / `x11droid-kbd` uinput devices
 
-## Launch Container
+## Launch Container (Recommended)
 
+```sh
+# Daemon + container in one command (Ctrl+C stops everything)
+make up
+# or
+sudo ./x11droid up [--images DIR]
+```
+
+**Legacy (daemon must be running first):**
 ```sh
 sudo scripts/launch_container.sh start --images container/images
 ```
@@ -112,8 +128,26 @@ LD_PRELOAD=/vendor/lib64/libGLES_x11droid.so <android-test-app>
 ## Stop & Cleanup
 
 ```sh
-make stop
+make down
+# or
+./x11droid down
 # or
 sudo scripts/launch_container.sh stop
 sudo scripts/launch_container.sh clean --yes
+```
+
+## Complete One-Liners
+
+```sh
+# Quick test (no container, no GPU, no root)
+make test
+
+# Demo: daemon + pattern, Ctrl+C to stop
+make demo
+
+# Full stack: daemon + container, Ctrl+C stops all
+make up
+
+# Stop everything
+make down
 ```

@@ -14,7 +14,16 @@
 ```sh
 git clone https://github.com/Hanshx28383/xorgdroid && cd x11droid
 make setup       # cek dependensi, build semua, pasang ke vendor overlay
-sudo make start  # jalankan daemon + kontainer (butuh image di container/images/)
+make test        # uji cepat: Xvfb + daemon + 30 frame, keluar otomatis
+make demo        # daemon + pola uji (Ctrl+C untuk berhenti)
+sudo make up     # daemon + kontainer Android (Ctrl+C menghentikan semua)
+```
+
+**Lama (masih berfungsi)**
+```sh
+make setup       # cek dependensi, build semua, pasang ke vendor overlay
+make start       # jalankan daemon + kontainer (butuh image di container/images/)
+make stop        # hentikan kontainer dan daemon
 ```
 
 **Dokumentasi**
