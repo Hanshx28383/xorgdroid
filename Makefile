@@ -60,7 +60,7 @@ $(info [x11droid] missing Makefile: $(PENDING) — skipped)
 endif
 endif
 
-.PHONY: all host android setup start stop status doctor check-deps run demo-producer clean distclean help $(COMPONENTS)
+.PHONY: all host android setup start stop status doctor check-deps run demo-producer clean distclean help test demo up down $(COMPONENTS)
 
 all: host android
 
@@ -131,6 +131,18 @@ stop:
 	@scripts/launch_container.sh --stop
 	@pkill -x x11droid-daemon 2>/dev/null || true
 	@echo "[stop] done"
+
+test:
+	@./x11droid test
+
+demo:
+	@./x11droid demo
+
+up:
+	@./x11droid up
+
+down:
+	@./x11droid down
 
 status:
 	@printf '%-16s %s\n' "component" "makefile"
@@ -212,9 +224,13 @@ help:
 	@echo "x11droid — Android-on-Linux container bridge (NVIDIA 470 + GLX)"
 	@echo ""
 	@echo "Quick start:"
-	@echo "  make setup   # check deps, build all, install to vendor overlay"
-	@echo "  make start   # run daemon + container (needs root, images in container/images/)"
-	@echo "  make stop    # stop container and daemon"
+	@echo "  make test          # quick test: Xvfb + daemon + 30 frames, auto-exit"
+	@echo "  make demo          # daemon + test pattern (Ctrl+C to stop)"
+	@echo "  make up            # daemon + Android container (Ctrl+C stops all)"
+	@echo "  make down          # stop container and daemon"
+	@echo "  make setup         # check deps, build all, install to vendor overlay"
+	@echo "  make start         # run daemon + container (needs root, images)"
+	@echo "  make stop          # stop container and daemon"
 	@echo ""
 	@echo "Build targets:"
 	@echo "  make all           build host + android (needs NDK)"
@@ -223,6 +239,10 @@ help:
 	@echo "  make setup         full build + install to vendor overlay + build.prop"
 	@echo ""
 	@echo "Runtime targets:"
+	@echo "  make test          quick test (Xvfb, CPU, auto-exit)"
+	@echo "  make demo          daemon + test pattern (Ctrl+C to stop)"
+	@echo "  make up            daemon + Android container (Ctrl+C stops all)"
+	@echo "  make down          stop container and daemon"
 	@echo "  make start         run daemon + container (needs root, images)"
 	@echo "  make run-daemon    run host daemon only (foreground)"
 	@echo "  make run-container run container only (needs root, daemon running)"
@@ -255,8 +275,10 @@ DIST_FILES := \
 	scripts/check-deps.sh \
 	lxc-config/config \
 	README.md \
+	README.id.md \
 	CONTRIBUTING.md \
-	report.txt
+	report.txt \
+	x11droid
 
 dist: all
 	@if [ ! -f $(BUILD_DIR)/host-daemon/x11droid-daemon ]; then echo "[dist] host-daemon is not built" >&2; exit 1; fi

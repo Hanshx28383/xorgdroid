@@ -1,0 +1,164 @@
+#!/usr/bin/env bash
+# x11droid - satu perintah untuk menjalankan semuanya (tanpa banyak terminal).
+set -euo pipefail
+
+ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+SOCK=${X11DROID_SOCK:-${XORG_DROID_SOCK:-/tmp/x11droid.sock}}
+SHM=${X11DROID_SHM:-x11droid_fb}
+IMAGES=${X11DROID_IMAGES:-$ROOT/container/images}
+DAEMON=${X11DROID_DAEMON:-$ROOT/build/host-daemon/x11droid-daemon}
+PRODUCER=${X11DROID_PRODUCER:-$ROOT/build/host-daemon/test_producer}
+LAUNCHER=$ROOT/scripts/launch_container.sh
+LOG=${X11DROID_LOG:-/tmp/x11droid-daemon.log}
+PIDFILE=${X11DROID_PIDFILE:-/tmp/x11droid.pid}
+FB=/dev/shm/$SHM
+
+usage() {
+  cat <<EOF
+Usage: ./x11droid <command> [options]
+
+Commands:
+  test [FRAMES]    Quick test without GPU/root: Xvfb + daemon + N frames, then exit
+  demo [FRAMES]    Run daemon + test pattern (Ctrl+C to stop, or after FRAMES)
+  up               Run daemon + Android container (Ctrl+C stops everything)
+  down             Stop container and daemon, clean up
+  status           Show daemon, socket, framebuffer, container status
+
+Options:
+  --headless       Use Xvfb (auto if DISPLAY empty); CPU path only
+  --no-gl          Force MIT-SHM/XPutImage (no GLX)
+  --no-shm         Force XPutImage (skip MIT-SHM)
+  --no-input       Skip uinput devices
+  --images DIR     Folder with system.img + vendor.img (default: container/images)
+  -h, --help       Show this help
+EOF
+}
+
+die() { echo "x11droid: $*" >&2; exit 1; }
+
+CMD=${1:-}; [ -n "$CMD" ] || { usage; exit 1; }; shift || true
+HEADLESS=0; FRAMES=""; DAEMON_FLAGS=()
+while [ $# -gt 0 ]; do
+  case $1 in
+    --headless) HEADLESS=1 ;;
+    --no-gl|--no-shm|--no-input) DAEMON_FLAGS+=("$1") ;;
+    --images) [ $# -ge 2 ] || die "--images needs argument"; IMAGES=$2; shift ;;
+    -h|--help) usage; exit 0 ;;
+    [0-9]*) FRAMES=$1 ;;
+    *) die "unknown option: $1 (see ./x11droid --help)" ;;
+  esac
+  shift
+done
+
+ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+SOCK=${X11DROID_SOCK:-${XORG_DROID_SOCK:-/tmp/x11droid.sock}}
+SHM=${X11DROID_SHM:-x11droid_fb}
+IMAGES=${X11DROID_IMAGES:-$ROOT/container/images}
+DAEMON=${X11DROID_DAEMON:-$ROOT/build/host-daemon/x11droid-daemon}
+PRODUCER=${X11DROID_PRODUCER:-$ROOT/build/host-daemon/test_producer}
+LAUNCHER=$ROOT/scripts/launch_container.sh
+LOG=${X11DROID_LOG:-/tmp/x11droid-daemon.log}
+PIDFILE=${X11DROID_PIDFILE:-/tmp/x11droid.pid}
+FB=/dev/shm/$SHM
+
+XPID=""; DPID=""; PPID_PROD=""; LAUNCHED=0; DISPLAY_PICKED=""
+cleanup() {
+  trap - EXIT INT TERM
+  [ "$LAUNCHED" = 1 ] && sudo "$LAUNCHER" --stop >/dev/null 2>&1 || true
+  for p in $PPID_PROD $DPID $XPID; do [ -n "$p" ] && kill "$p" 2>/dev/null || true; done
+  sleep 0.3
+  rm -f "$PIDFILE" "$SOCK" "$FB"
+  [ -n "$DISPLAY_PICKED" ] && [ -n "$XPID" ] && kill "$XPID" 2>/dev/null || true
+}
+
+ensure_built() {
+  [ -x "$DAEMON" ] || { echo ">> building host components..."; make -C "$ROOT" host >/dev/null \
+    || die "build failed. Run 'make check-deps' to see missing packages."; }
+}
+
+pick_free_display() {
+  for d in :99 :98 :97 :96 :95; do
+    if ! xdpyinfo -display "$d" >/dev/null 2>&1; then
+      echo "$d"; return 0
+    fi
+  done
+  die "no free X display found (:99-:95 all busy)"
+}
+
+start_xvfb() {
+  command -v Xvfb >/dev/null || die "Xvfb not installed. Install: sudo apt install xvfb"
+  DISPLAY_PICKED=$(pick_free_display)
+  Xvfb "$DISPLAY_PICKED" -screen 0 720x1280x24 >/dev/null 2>&1 & XPID=$!
+  export DISPLAY="$DISPLAY_PICKED"
+  sleep 1
+  kill -0 "$XPID" 2>/dev/null || die "Xvfb failed to start on $DISPLAY_PICKED"
+}
+
+start_daemon() {
+  if [ "$HEADLESS" = 1 ] || [ -z "${DISPLAY:-}" ]; then
+    HEADLESS=1; start_xvfb; DAEMON_FLAGS+=(--no-gl)
+  fi
+  rm -f "$SOCK"
+  "$DAEMON" --display "$DISPLAY" --socket "$SOCK" --shm "$SHM" "${DAEMON_FLAGS[@]}" >"$LOG" 2>&1 &
+  DPID=$!; echo "$DPID" >"$PIDFILE"
+  for _ in $(seq 1 50); do
+    [ -e "$SOCK" ] && [ -e "$FB" ] && return 0
+    kill -0 "$DPID" 2>/dev/null || { tail -n 15 "$LOG" >&2
+      die "daemon died. No GLX? try --no-gl. No uinput? try --no-input. Log: $LOG"; }
+    sleep 0.2
+  done
+  die "daemon not ready in 10s. Log: $LOG"
+}
+
+case $CMD in
+  test)
+    [ $# -ge 1 ] && [ "${1:-}" -eq "${1:-}" ] 2>/dev/null && FRAMES=$1 && shift || true
+    FRAMES=${FRAMES:-30}
+    trap cleanup EXIT INT TERM
+    ensure_built
+    HEADLESS=1
+    start_daemon
+    if "$PRODUCER" --frames "$FRAMES" --socket "$SOCK"; then
+      echo "OK: $FRAMES frames sent"
+    else
+      die "FAIL: producer error (log: $LOG)"
+    fi
+    ;;
+  demo)
+    [ $# -ge 1 ] && [ "${1:-}" -eq "${1:-}" ] 2>/dev/null && FRAMES=$1 && shift || true
+    trap cleanup EXIT INT TERM
+    ensure_built
+    start_daemon
+    echo ">> sending test pattern (Ctrl+C to stop)"
+    "$PRODUCER" ${FRAMES:+--frames "$FRAMES"} --socket "$SOCK"
+    ;;
+  up)
+    [ -d "$IMAGES" ] || die "images dir not found: $IMAGES (put system.img + vendor.img there)"
+    trap cleanup EXIT INT TERM
+    ensure_built
+    start_daemon
+    echo ">> starting container (needs sudo)..."
+    LAUNCHED=1
+    sudo "$LAUNCHER" --images "$IMAGES"
+    echo ">> running. Ctrl+C to stop everything."
+    wait "$DPID"
+    ;;
+  down)
+    sudo "$LAUNCHER" --stop >/dev/null 2>&1 || true
+    [ -f "$PIDFILE" ] && kill "$(cat "$PIDFILE")" 2>/dev/null || true
+    rm -f "$PIDFILE" "$SOCK" "$FB"
+    echo "stopped"
+    ;;
+  status)
+    if [ -f "$PIDFILE" ] && kill -0 "$(cat "$PIDFILE")" 2>/dev/null; then
+      echo "daemon : running (pid $(cat "$PIDFILE"))"
+    else
+      echo "daemon : stopped"
+    fi
+    [ -e "$SOCK" ] && echo "socket : $SOCK" || echo "socket : missing"
+    [ -e "$FB" ] && echo "fb     : $FB" || echo "fb     : missing"
+    sudo "$LAUNCHER" status 2>/dev/null || echo "container : unknown (run with sudo for details)"
+    ;;
+  *)
+    usage; exit 1 ;;
+esac
